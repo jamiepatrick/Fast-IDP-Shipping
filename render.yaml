@@ -1,0 +1,28 @@
+services:
+  - type: web
+    name: fastidp-shipping
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --timeout 120 --workers 1 --worker-class gthread --threads 1
+    envVars:
+      - key: FEDEX_ACCOUNT_NUMBER
+        sync: false
+      - key: FEDEX_CLIENT_ID
+        sync: false
+      - key: FEDEX_CLIENT_SECRET
+        sync: false
+      - key: FEDEX_CLIENT_ID_TEST
+        sync: false
+      - key: FEDEX_CLIENT_SECRET_TEST
+        sync: false
+      - key: FEDEX_ENV
+        value: test
+      - key: JOTFORM_API_KEY
+        sync: false
+      - key: RESEND_API_KEY
+        sync: false
+      - key: RESEND_FROM
+        sync: false
+      - key: RECIPIENT_EMAIL
+        value: jamie@fastidp.com
