@@ -111,6 +111,30 @@ def logs():
     return jsonify(list(_log_buffer))
 
 
+@app.route("/test", methods=["GET"])
+def test_reprocess():
+    """Reprocess the most recent Jotform submission (or a specific one via ?id=...)."""
+    submission_id = request.args.get("id", "")
+    if not submission_id:
+        # Fetch most recent submission from the form
+        url = (f"https://api.jotform.com/form/{JOTFORM_FORM_ID}/submissions"
+               f"?apiKey={JOTFORM_API_KEY}&limit=1&orderby=id,DESC")
+        resp = requests.get(url, timeout=15)
+        resp.raise_for_status()
+        subs = resp.json().get("content", [])
+        if not subs:
+            return jsonify({"status": "error", "message": "No submissions found"}), 404
+        submission_id = str(subs[0].get("id"))
+
+    thread = threading.Thread(
+        target=process_submission,
+        args=(submission_id,),
+        daemon=True,
+    )
+    thread.start()
+    return jsonify({"status": "accepted", "submissionID": submission_id}), 200
+
+
 @app.route("/webhook", methods=["POST"])
 def handle_webhook():
     raw = request.form.get("rawRequest", "")
