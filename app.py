@@ -387,7 +387,7 @@ def build_shipment_payload(order, service_type, use_one_rate):
             "labelSpecification": {
                 "labelFormatType": "COMMON2D",
                 "imageType": "PNG",
-                "labelStockType": "STOCK_4X6",
+                "labelStockType": "PAPER_4X6",
             },
             "requestedPackageLineItems": [{
                 "weight": {
