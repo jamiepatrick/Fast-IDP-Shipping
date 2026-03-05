@@ -362,7 +362,7 @@ def build_shipment_payload(order, service_type, use_one_rate):
             },
             "labelSpecification": {
                 "labelFormatType": "COMMON2D",
-                "imageType": "PDF",
+                "imageType": "PNG",
                 "labelStockType": "STOCK_4X6",
             },
             "requestedPackageLineItems": [{
@@ -548,7 +548,7 @@ def process_submission(submission_id):
             f"Tracking: {tracking_number}\n"
         )
 
-        filename = f"{recipient_name.replace(' ', '_')}_{order_id}_label.pdf"
+        filename = f"{recipient_name.replace(' ', '_')}_{order_id}_label.png"
         send_email(subject, body, [(filename, label_pdf)])
 
         logger.info(f"=== DONE: {submission_id} — tracking {tracking_number} ===")
