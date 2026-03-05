@@ -330,8 +330,12 @@ def build_shipment_payload(order, service_type, use_one_rate):
     if order.get("street2"):
         street_lines.append(order["street2"])
 
+    # In test mode, use the FedEx sandbox account number
+    account = "740561073" if FEDEX_ENV == "test" else FEDEX_ACCOUNT_NUMBER
+
     payload = {
-        "accountNumber": {"value": FEDEX_ACCOUNT_NUMBER},
+        "labelResponseOptions": "LABEL",
+        "accountNumber": {"value": account},
         "requestedShipment": {
             "shipper": {
                 "address": SHIPPER_ADDRESS,
