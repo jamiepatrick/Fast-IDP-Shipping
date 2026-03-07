@@ -17,7 +17,7 @@ services:
       - key: FEDEX_CLIENT_SECRET_TEST
         sync: false
       - key: FEDEX_ENV
-        value: test
+        value: production
       - key: JOTFORM_API_KEY
         sync: false
       - key: RESEND_API_KEY
