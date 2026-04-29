@@ -1,0 +1,35 @@
+name: Keep Render service awake
+
+# Pings the health endpoint every 10 minutes to prevent Render free tier
+# from spinning down (which causes Jotform webhooks to time out on cold start
+# — and Jotform does not retry failed webhooks, so missed submissions never
+# get a label).
+#
+# GitHub Actions cron is best-effort and may run late under load; for a
+# permanent fix, upgrade Render to the Starter plan ($7/mo) and disable
+# this workflow.
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"   # every 10 minutes
+  workflow_dispatch:          # allow manual run from the Actions tab
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Ping health endpoint
+        run: |
+          URL="https://fastidp-shipping.onrender.com/"
+          echo "Pinging $URL"
+          # -m 90 = 90s max (allows for cold start), --retry 2 for transient failures
+          # Fail the job on non-2xx so notifications fire
+          HTTP_CODE=$(curl -s -m 90 --retry 2 --retry-delay 5 -o /tmp/resp.json -w "%{http_code}" "$URL")
+          echo "HTTP $HTTP_CODE"
+          cat /tmp/resp.json || true
+          echo ""
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "::error::Health check returned HTTP $HTTP_CODE"
+            exit 1
+          fi

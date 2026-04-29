@@ -6,6 +6,7 @@ the domestic checkout form on Jotform.
 
 import base64
 import collections
+import datetime
 import gc
 import json
 import logging
@@ -113,10 +114,13 @@ def logs():
 
 @app.route("/test", methods=["GET"])
 def test_reprocess():
-    """Reprocess the most recent Jotform submission (or a specific one via ?id=...)."""
+    """Reprocess the most recent Jotform submission (or a specific one via ?id=...).
+
+    Pass ?force=1 to bypass the already-processed check and create another label.
+    """
     submission_id = request.args.get("id", "")
+    force = request.args.get("force", "").lower() in ("1", "true", "yes")
     if not submission_id:
-        # Fetch most recent submission from the form
         url = (f"https://api.jotform.com/form/{JOTFORM_FORM_ID}/submissions"
                f"?apiKey={JOTFORM_API_KEY}&limit=1&orderby=id,DESC")
         resp = requests.get(url, timeout=15)
@@ -129,10 +133,101 @@ def test_reprocess():
     thread = threading.Thread(
         target=process_submission,
         args=(submission_id,),
+        kwargs={"force": force},
         daemon=True,
     )
     thread.start()
-    return jsonify({"status": "accepted", "submissionID": submission_id}), 200
+    return jsonify({"status": "accepted", "submissionID": submission_id, "force": force}), 200
+
+
+@app.route("/reconcile", methods=["GET", "POST"])
+def reconcile():
+    """Find recent unprocessed submissions and create labels for them.
+
+    Backstop for missed Jotform webhooks (Render free-tier cold starts cause
+    Jotform's non-retrying webhook to silently drop). Looks for submissions
+    where Jotform's `new` flag is still "1" (we mark it "0" after a successful
+    label) within the last `max_age_hours` (default 2).
+    """
+    try:
+        max_age_hours = float(request.args.get("max_age_hours", "2"))
+    except ValueError:
+        max_age_hours = 2.0
+
+    cutoff = datetime.datetime.utcnow() - datetime.timedelta(hours=max_age_hours)
+
+    url = (f"https://api.jotform.com/form/{JOTFORM_FORM_ID}/submissions"
+           f"?apiKey={JOTFORM_API_KEY}&limit=50&orderby=created_at,DESC"
+           f"&filter=%7B%22new%22%3A%221%22%7D")  # filter={"new":"1"}
+    resp = requests.get(url, timeout=15)
+    resp.raise_for_status()
+    subs = resp.json().get("content", [])
+
+    candidates = []
+    for sub in subs:
+        if str(sub.get("new", "0")) != "1":
+            continue
+        created_at = sub.get("created_at", "")
+        try:
+            created_dt = datetime.datetime.strptime(created_at, "%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            logger.warning(f"Could not parse created_at '{created_at}' for {sub.get('id')}")
+            continue
+        if created_dt < cutoff:
+            continue
+        candidates.append(str(sub.get("id")))
+
+    logger.info(f"Reconcile: {len(candidates)} unprocessed submissions in last {max_age_hours}h")
+
+    for sid in candidates:
+        thread = threading.Thread(
+            target=process_submission,
+            args=(sid,),
+            daemon=True,
+        )
+        thread.start()
+
+    return jsonify({
+        "status": "accepted",
+        "max_age_hours": max_age_hours,
+        "queued": candidates,
+    }), 200
+
+
+@app.route("/admin/mark-all-read", methods=["POST"])
+def admin_mark_all_read():
+    """One-time cleanup: mark every existing new=1 submission as read.
+
+    Use this once after first deploying the reconcile feature so that pre-
+    existing submissions (which were processed via webhook but never had
+    Jotform's `new` flag flipped) don't get re-labeled by the reconcile sweep.
+
+    Requires ?confirm=yes to prevent accidental calls.
+    """
+    if request.args.get("confirm") != "yes":
+        return jsonify({"status": "error", "message": "Add ?confirm=yes to run"}), 400
+
+    url = (f"https://api.jotform.com/form/{JOTFORM_FORM_ID}/submissions"
+           f"?apiKey={JOTFORM_API_KEY}&limit=200&orderby=created_at,DESC"
+           f"&filter=%7B%22new%22%3A%221%22%7D")
+    resp = requests.get(url, timeout=15)
+    resp.raise_for_status()
+    subs = resp.json().get("content", [])
+
+    marked = []
+    failed = []
+    for sub in subs:
+        sid = str(sub.get("id"))
+        if mark_submission_read(sid):
+            marked.append(sid)
+        else:
+            failed.append(sid)
+
+    return jsonify({
+        "status": "ok",
+        "marked_read": len(marked),
+        "failed": failed,
+    }), 200
 
 
 @app.route("/webhook", methods=["POST"])
@@ -197,6 +292,26 @@ def fetch_submission_fallback(submission_id):
         if str(sub.get("id")) == str(submission_id):
             return sub
     raise ValueError(f"Submission {submission_id} not found in recent submissions")
+
+
+def mark_submission_read(submission_id):
+    """Set Jotform's `new` flag to 0 to mark the submission as processed.
+
+    This is our durable "label was generated" signal — the reconcile job uses
+    it to decide whether a submission still needs processing.
+    """
+    url = f"https://api.jotform.com/submission/{submission_id}"
+    resp = requests.post(
+        url,
+        params={"apiKey": JOTFORM_API_KEY},
+        data={"submission[new]": "0"},
+        timeout=15,
+    )
+    if resp.status_code >= 400:
+        logger.warning(f"Failed to mark {submission_id} read: {resp.status_code} {resp.text[:200]}")
+        return False
+    logger.info(f"Marked submission {submission_id} as read")
+    return True
 
 
 def extract_order_data(submission):
@@ -522,24 +637,55 @@ def send_email(subject, body, attachments=None):
 
 # ── Main processing ─────────────────────────────────────────────────────────
 
-def process_submission(submission_id):
-    """Main processing function — runs in background thread."""
-    try:
-        logger.info(f"=== Processing submission {submission_id} ===")
+# In-process lock keyed by submission_id. Prevents the webhook handler and the
+# reconcile sweep from racing on the same submission and creating two labels.
+_processing_locks = set()
+_processing_locks_mutex = threading.Lock()
 
-        # 1. Fetch submission from Jotform
+
+def _claim_submission(submission_id):
+    with _processing_locks_mutex:
+        if submission_id in _processing_locks:
+            return False
+        _processing_locks.add(submission_id)
+        return True
+
+
+def _release_submission(submission_id):
+    with _processing_locks_mutex:
+        _processing_locks.discard(submission_id)
+
+
+def process_submission(submission_id, force=False):
+    """Main processing function — runs in background thread.
+
+    If `force` is False (default), skips submissions that Jotform already has
+    marked as read (`new=0`), which is our "label was created" signal.
+    """
+    submission_id = str(submission_id)
+
+    if not _claim_submission(submission_id):
+        logger.info(f"Skip {submission_id}: already being processed in another thread")
+        return
+
+    try:
+        logger.info(f"=== Processing submission {submission_id} (force={force}) ===")
+
         submission = fetch_submission(submission_id)
         if not submission:
             raise ValueError("Empty submission returned from Jotform")
 
-        # 2. Extract order data
+        if not force and str(submission.get("new", "1")) == "0":
+            logger.info(f"Skip {submission_id}: already marked read on Jotform "
+                        f"(label previously generated). Use force=1 to override.")
+            return
+
         order = extract_order_data(submission)
         logger.info(f"Order data: name={order.get('recipient_name')}, "
                      f"city={order.get('city')}, state={order.get('state')}, "
                      f"zip={order.get('postal')}, speed={order.get('shipping_speed')}, "
                      f"order_id={order.get('order_id')}")
 
-        # Validate required fields
         missing = []
         for field in ("recipient_name", "street1", "city", "state", "postal"):
             if not order.get(field):
@@ -549,13 +695,11 @@ def process_submission(submission_id):
 
         gc.collect()
 
-        # 3. Create FedEx shipping label
         tracking_number, label_pdf, service_used = create_shipping_label(order)
         logger.info(f"FedEx label created: tracking={tracking_number}, service={service_used}")
 
         gc.collect()
 
-        # 4. Email the label
         order_id = order.get("order_id", submission_id)
         recipient_name = order.get("recipient_name", "Unknown")
         speed = order.get("shipping_speed", "unknown")
@@ -575,6 +719,11 @@ def process_submission(submission_id):
         filename = f"{recipient_name.replace(' ', '_')}_{order_id}_label.png"
         send_email(subject, body, [(filename, label_pdf)])
 
+        # Mark as read only after the label email is successfully sent. If
+        # anything before this raised, the submission stays new=1 and the
+        # next /reconcile sweep will retry it.
+        mark_submission_read(submission_id)
+
         logger.info(f"=== DONE: {submission_id} — tracking {tracking_number} ===")
 
     except Exception as e:
@@ -586,6 +735,8 @@ def process_submission(submission_id):
             )
         except Exception as e2:
             logger.error(f"Failed to send error notification: {e2}")
+    finally:
+        _release_submission(submission_id)
 
 
 # ── Entry point ──────────────────────────────────────────────────────────────

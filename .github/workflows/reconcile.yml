@@ -1,0 +1,35 @@
+name: Reconcile missed shipments
+
+# Hourly backstop for the Jotform webhook. If a submission's webhook ever
+# fails (cold start, transient FedEx error, etc.), Jotform does not retry,
+# so /reconcile sweeps recent submissions and labels any that are still
+# marked unread on Jotform (which is the signal that no label was generated).
+#
+# Idempotency is handled inside /reconcile — it checks Jotform's `new` flag
+# and only processes submissions where new=1.
+
+on:
+  schedule:
+    - cron: "15 * * * *"      # every hour at :15 (offset from keep-alive)
+  workflow_dispatch:           # allow manual run from the Actions tab
+
+jobs:
+  reconcile:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Trigger /reconcile
+        run: |
+          # max_age_hours=2 gives one hour of overlap with the previous sweep
+          # so a missed run doesn't immediately drop submissions on the floor.
+          URL="https://fastidp-shipping.onrender.com/reconcile?max_age_hours=2"
+          echo "POSTing $URL"
+          HTTP_CODE=$(curl -s -m 90 --retry 2 --retry-delay 10 \
+            -X POST -o /tmp/resp.json -w "%{http_code}" "$URL")
+          echo "HTTP $HTTP_CODE"
+          cat /tmp/resp.json || true
+          echo ""
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "::error::Reconcile returned HTTP $HTTP_CODE"
+            exit 1
+          fi
