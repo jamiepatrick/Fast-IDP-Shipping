@@ -40,7 +40,10 @@ logger.addHandler(_bh)
 JOTFORM_API_KEY = os.environ.get("JOTFORM_API_KEY", "")
 JOTFORM_FORM_ID = os.environ.get("JOTFORM_FORM_ID", "243185801206047")
 
-FEDEX_ACCOUNT_NUMBER = os.environ.get("FEDEX_ACCOUNT_NUMBER", "")
+_raw_fedex_account = os.environ.get("FEDEX_ACCOUNT_NUMBER", "")
+FEDEX_ACCOUNT_NUMBER = "".join(ch for ch in _raw_fedex_account if ch.isdigit())
+if _raw_fedex_account and FEDEX_ACCOUNT_NUMBER != _raw_fedex_account:
+    logger.warning("FEDEX_ACCOUNT_NUMBER contained non-digit characters; sanitized before use")
 FEDEX_ENV = os.environ.get("FEDEX_ENV", "test")  # "test" or "production"
 
 FEDEX_CLIENT_ID = os.environ.get("FEDEX_CLIENT_ID", "")
