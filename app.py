@@ -589,8 +589,9 @@ def create_shipping_label(order):
                 last_error = "Label PDF not found in FedEx response"
                 continue
 
-            logger.info(f"Label created: {service_desc}, tracking: {tracking_number}")
-            return tracking_number, label_pdf, service_type
+            cost = extract_label_cost(shipment)
+            logger.info(f"Label created: {service_desc}, tracking: {tracking_number}, cost: {cost or 'unknown'}")
+            return tracking_number, label_pdf, service_type, cost
 
         except requests.RequestException as e:
             logger.warning(f"Request error for {service_desc}: {e}")
@@ -598,6 +599,49 @@ def create_shipping_label(order):
             continue
 
     raise RuntimeError(f"All FedEx service options failed. Last error: {last_error}")
+
+
+def extract_label_cost(shipment):
+    """Pull the billed amount out of a FedEx Ship API transactionShipment.
+
+    FedEx returns rate info in two shapes depending on the shipment:
+    - shipmentRating.shipmentRateDetails[*].totalNetCharge (+ currency)
+    - pieceResponses[*].netChargeAmount (+ currency, often under packageRateDetails)
+    Returns a formatted string like "$12.34 USD" or None if no rate was returned.
+    """
+    rating = shipment.get("shipmentRating") or {}
+    for detail in rating.get("shipmentRateDetails", []) or []:
+        amount = detail.get("totalNetCharge")
+        currency = detail.get("currency") or detail.get("currencyCode") or ""
+        if isinstance(amount, dict):
+            currency = amount.get("currency") or amount.get("currencyCode") or currency
+            amount = amount.get("amount")
+        if amount is not None:
+            return _format_money(amount, currency)
+
+    for piece in shipment.get("pieceResponses", []) or []:
+        amount = piece.get("netChargeAmount")
+        currency = piece.get("currency") or ""
+        if amount is not None:
+            return _format_money(amount, currency)
+        for detail in piece.get("packageRateDetails", []) or []:
+            net = detail.get("netCharge")
+            if isinstance(net, dict):
+                amount = net.get("amount")
+                currency = net.get("currency") or net.get("currencyCode") or ""
+            else:
+                amount = net
+            if amount is not None:
+                return _format_money(amount, currency)
+
+    return None
+
+
+def _format_money(amount, currency):
+    try:
+        return f"${float(amount):.2f} {currency}".strip()
+    except (TypeError, ValueError):
+        return f"{amount} {currency}".strip()
 
 
 # ── Email ────────────────────────────────────────────────────────────────────
@@ -698,8 +742,8 @@ def process_submission(submission_id, force=False):
 
         gc.collect()
 
-        tracking_number, label_pdf, service_used = create_shipping_label(order)
-        logger.info(f"FedEx label created: tracking={tracking_number}, service={service_used}")
+        tracking_number, label_pdf, service_used, label_cost = create_shipping_label(order)
+        logger.info(f"FedEx label created: tracking={tracking_number}, service={service_used}, cost={label_cost or 'unknown'}")
 
         gc.collect()
 
@@ -717,6 +761,7 @@ def process_submission(submission_id, force=False):
             f"Service: {service_used}\n"
             f"Speed selected: {speed}\n"
             f"Tracking: {tracking_number}\n"
+            f"Label cost: {label_cost or 'not returned by FedEx'}\n"
         )
 
         filename = f"{recipient_name.replace(' ', '_')}_{order_id}_label.png"
