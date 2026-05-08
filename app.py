@@ -70,7 +70,7 @@ SHIPPER_ADDRESS = {
 
 SHIPPER_CONTACT = {
     "personName": "Fast IDP",
-    "phoneNumber": "0000000000",
+    "phoneNumber": "9375950044",
 }
 
 # ── State name → abbreviation mapping ────────────────────────────────────────
