@@ -107,6 +107,9 @@ def health():
         "fedex_account": bool(FEDEX_ACCOUNT_NUMBER),
         "jotform_key": bool(JOTFORM_API_KEY),
         "resend_key": bool(RESEND_API_KEY),
+        # Render injects RENDER_GIT_COMMIT at build time. Lets us confirm
+        # which source revision is actually live without guessing.
+        "git_commit": os.environ.get("RENDER_GIT_COMMIT", "unknown")[:12],
     })
 
 
