@@ -143,6 +143,68 @@ def test_reprocess():
     return jsonify({"status": "accepted", "submissionID": submission_id, "force": force}), 200
 
 
+@app.route("/quote", methods=["GET"])
+def quote():
+    """Return FedEx Rate API quotes for a submission without creating a label.
+
+    Query params:
+      ?id=<submission_id>  — quote a specific submission
+      ?name=<text>         — find the most recent submission whose recipient
+                             name contains this text (case-insensitive)
+    With no params, quotes the most recent submission.
+    """
+    submission_id = request.args.get("id", "").strip()
+    name_query = request.args.get("name", "").strip().lower()
+
+    if not submission_id:
+        list_url = (f"https://api.jotform.com/form/{JOTFORM_FORM_ID}/submissions"
+                    f"?apiKey={JOTFORM_API_KEY}&limit=50&orderby=created_at,DESC")
+        resp = requests.get(list_url, timeout=15)
+        resp.raise_for_status()
+        subs = resp.json().get("content", [])
+        if not subs:
+            return jsonify({"status": "error", "message": "No submissions found"}), 404
+
+        if name_query:
+            matched = None
+            for sub in subs:
+                for _, ans in sub.get("answers", {}).items():
+                    if ans.get("name", "").lower() != "recipientname":
+                        continue
+                    val = ans.get("answer")
+                    if isinstance(val, dict):
+                        full = f"{val.get('first', '')} {val.get('last', '')}".lower()
+                    else:
+                        full = str(val).lower()
+                    if name_query in full:
+                        matched = sub
+                        break
+                if matched:
+                    break
+            if not matched:
+                return jsonify({"status": "error",
+                                "message": f"No submission in last 50 matches name '{name_query}'"}), 404
+            submission_id = str(matched.get("id"))
+        else:
+            submission_id = str(subs[0].get("id"))
+
+    submission = fetch_submission(submission_id)
+    if not submission:
+        return jsonify({"status": "error", "message": "Submission not found"}), 404
+
+    order = extract_order_data(submission)
+    quotes = get_rate_quote(order)
+
+    return jsonify({
+        "submission_id": submission_id,
+        "recipient": order.get("recipient_name"),
+        "shipping_speed": order.get("shipping_speed"),
+        "destination": f"{order.get('city', '')}, {order.get('state', '')} {order.get('postal', '')}",
+        "quotes": quotes,
+        "note": "Rate API estimate — final invoiced amount may differ slightly due to fuel/surcharges.",
+    }), 200
+
+
 @app.route("/reconcile", methods=["GET", "POST"])
 def reconcile():
     """Find recent unprocessed submissions and create labels for them.
@@ -638,10 +700,121 @@ def extract_label_cost(shipment):
 
 
 def _format_money(amount, currency):
+    if amount is None:
+        return None
     try:
         return f"${float(amount):.2f} {currency}".strip()
     except (TypeError, ValueError):
         return f"{amount} {currency}".strip()
+
+
+def extract_rate_from_reply(reply):
+    """Pull the total net charge out of a rateReplyDetails entry."""
+    for rated in reply.get("ratedShipmentDetails", []) or []:
+        total = rated.get("totalNetCharge")
+        currency = rated.get("currency") or rated.get("currencyCode") or ""
+        if isinstance(total, dict):
+            return _format_money(
+                total.get("amount"),
+                total.get("currency") or total.get("currencyCode") or currency,
+            )
+        if total is not None:
+            return _format_money(total, currency)
+    return None
+
+
+def build_rate_payload(order, service_type, use_one_rate):
+    """Build a FedEx Rate API JSON payload mirroring build_shipment_payload."""
+    street_lines = [order["street1"]]
+    if order.get("street2"):
+        street_lines.append(order["street2"])
+
+    account = "740561073" if FEDEX_ENV == "test" else FEDEX_ACCOUNT_NUMBER
+
+    payload = {
+        "accountNumber": {"value": account},
+        "requestedShipment": {
+            "shipper": {"address": SHIPPER_ADDRESS},
+            "recipient": {
+                "address": {
+                    "streetLines": street_lines,
+                    "city": order["city"],
+                    "stateOrProvinceCode": order["state"],
+                    "postalCode": order["postal"],
+                    "countryCode": "US",
+                },
+            },
+            "pickupType": "DROPOFF_AT_FEDEX_LOCATION",
+            "serviceType": service_type,
+            "packagingType": "FEDEX_ENVELOPE",
+            "rateRequestType": ["ACCOUNT"],
+            "requestedPackageLineItems": [{
+                "weight": {"units": "LB", "value": 0.25},
+            }],
+        },
+    }
+
+    if use_one_rate:
+        payload["requestedShipment"]["shipmentSpecialServices"] = {
+            "specialServiceTypes": ["FEDEX_ONE_RATE"],
+        }
+
+    return payload
+
+
+def get_rate_quote(order):
+    """Call the FedEx Rate API for the same service options the label code would try.
+
+    Returns a list of dicts: {service, one_rate, cost} or {service, one_rate, error}.
+    """
+    token = get_fedex_token()
+    base = FEDEX_BASE_URLS[FEDEX_ENV]
+    url = f"{base}/rate/v1/rates/quotes"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+        "X-Locale": "en_US",
+    }
+
+    service_options = determine_fedex_service(order.get("shipping_speed", "standard"))
+    quotes = []
+    for service_type, use_one_rate in service_options:
+        payload = build_rate_payload(order, service_type, use_one_rate)
+        service_desc = f"{service_type} (One Rate: {use_one_rate})"
+        try:
+            resp = requests.post(url, json=payload, headers=headers, timeout=30)
+            if resp.status_code >= 400:
+                logger.warning(f"Rate API error for {service_desc}: {resp.status_code} - {resp.text[:300]}")
+                quotes.append({
+                    "service": service_type,
+                    "one_rate": use_one_rate,
+                    "error": f"{resp.status_code}: {resp.text[:300]}",
+                })
+                continue
+            data = resp.json()
+            replies = data.get("output", {}).get("rateReplyDetails", []) or []
+            if not replies:
+                quotes.append({
+                    "service": service_type,
+                    "one_rate": use_one_rate,
+                    "error": "No rateReplyDetails in response",
+                })
+                continue
+            for reply in replies:
+                quotes.append({
+                    "service": reply.get("serviceType", service_type),
+                    "service_name": reply.get("serviceName"),
+                    "one_rate": use_one_rate,
+                    "cost": extract_rate_from_reply(reply),
+                })
+        except requests.RequestException as e:
+            logger.warning(f"Rate request error for {service_desc}: {e}")
+            quotes.append({
+                "service": service_type,
+                "one_rate": use_one_rate,
+                "error": str(e),
+            })
+    return quotes
 
 
 # ── Email ────────────────────────────────────────────────────────────────────
